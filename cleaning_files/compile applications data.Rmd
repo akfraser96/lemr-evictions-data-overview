@@ -1,0 +1,157 @@
+---
+title: "compile applications data"
+author: "Adam Fraser"
+date: "2024-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(ggmap)
+library(purrr)
+library(leaflet)
+```
+
+
+```{r, include=FALSE, eval=FALSE}
+# Set the path to the directory containing the files
+path <- "data/ontario_evictions_filings_2010_to_2022/eviction applications"
+
+
+# List all files to read
+file_list <- list.files(path, full.names = TRUE)
+
+
+
+
+
+# Define a function to rename columns if they exist
+rename_columns <- function(df) {
+  rename_map <- c(
+    "Notice" = "Notice Type",
+    "Notice Form" = "Notice Type",
+    "File Number" = "Case Number",
+    #"File Submission Date" = "Filing Date",
+    #"Close Date" = "Disposition Date",
+    "Reason for Closure" = "Disposition",
+    "Application Type" = "Category",
+     "Applications" = "Case Type"
+
+  )
+
+  for (original_name in names(rename_map)) {
+    if (original_name %in% names(df)) {
+      names(df)[names(df) == original_name] <- rename_map[[original_name]]
+    }
+  }
+  return(df)
+}
+
+
+# Read and bind all the files together
+combined_apps_data <- file_list %>%
+  lapply(function(file) {
+    df <- read_excel(file)
+    df <- rename_columns(df)
+    df$file_source <- basename(file)
+    return(df)
+  }) %>%
+  bind_rows()
+
+combined_apps_data <- combined_apps_data |>
+  janitor::clean_names() |>
+  mutate(
+    rental_unit_address = pmap_chr(list(street_number, street_name, city, postal_code), function(...) {
+    paste(na.omit(c(...)), collapse = " ")
+    }),
+    file_submission_date = as.Date(file_submission_date, format = "%Y-%m-%d"),
+    filing_date = if_else(is.na(filing_date), file_submission_date, as.Date(filing_date)),
+    year = year(filing_date), 
+    close_date = as.Date(close_date, format = "%Y-%m-%d"),
+    disposition_date = if_else(is.na(disposition_date), close_date, as.Date(disposition_date))
+  ) |>
+  select(-any_of(c("close_date", "applications", "form", "street_number", "file_submission_date", "street_name", "city", "postal_code")))
+
+# Separate case type into multiple rows, representing each type of case that is concatenated into the original format.
+combined_apps_data <- combined_apps_data |>
+    separate_rows(case_type, sep = "[/;]")
+```
+
+
+# Plot out case types across years
+
+```{r, fig.width= 11}
+app_summaries <- combined_apps_data |>
+  group_by(year, case_type, case_number) |> slice(1) |> ungroup() |>
+  mutate("Cancelled by Coordinator" = disposition == "Cancelled by Coordinator") |>
+  group_by(year, case_type) |>
+  summarise(case_types_filed = n(),
+            case_types_not_cancelled = sum(!`Cancelled by Coordinator`))
+
+app_summaries_long <- app_summaries |>
+  filter(case_type != "") |>
+  ungroup() |>
+  pivot_longer(cols = c(case_types_filed, case_types_not_cancelled),
+               names_to = "variable",
+               values_to = "n")
+
+
+# Corrected plot code
+p <- ggplot(app_summaries_long, aes(x = year, y = n, color = variable)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(~case_type, scales = "free_y", ncol = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Adjust the size of facet titles
+        panel.spacing = unit(2, "lines")) +
+  scale_x_continuous(breaks = seq(min(app_summaries_long$year), max(app_summaries_long$year), by = 2)) +
+  labs(title = "Notices Filed by Year in Ontario",
+       x = element_blank(),
+       y = "Notices Filed")
+
+plotly::ggplotly(p)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r, include=FALSE, eval=FALSE}
+# Remove “cancelled by coordinator” (this data was entered in error; n = 906 in applications, n = 157 in notices)
+cleaned_apps_data <- combined_apps_data |>
+  #filter(disposition == "Cancelled by Coordinator") |>
+  mutate(use_with_caution = ifelse(disposition == "Cancelled by Coordinator", "the application was data entered in error", NA)) |>
+  mutate(disposition_year = year(disposition_date)) |>
+  select(case_number, category, case_type, filing_date, "filing_year" = year, rental_unit_address, disposition, disposition_date, disposition_year, use_with_caution, file_source) 
+
+cleaned_apps_data <- cleaned_apps_data |>
+  arrange(desc(filing_date), case_number)
+
+# df <- combined_apps_data |>
+#    mutate(disp_year = year(disposition_date)) |>
+#   # filter(disp_year < 2022 &
+#   #           disposition == "Cancelled by Coordinator") |>
+#   group_by(case_number) |>
+#   add_count() |>
+#   arrange(desc(n), case_number)
+# 
+# 
+# combined_apps_data |>
+#   group_by(case_type) |>
+#   summarise(n = n()) |>
+#   arrange(desc(n))
+
+  
+
+saveRDS(cleaned_apps_data, "data/cleaned/cleaned_application_data.rds")
+```

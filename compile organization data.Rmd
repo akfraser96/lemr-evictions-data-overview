@@ -1,0 +1,85 @@
+---
+title: "compile filing organization data"
+author: "Adam Fraser"
+date: "2024-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(ggmap)
+library(purrr)
+library(leaflet)
+```
+
+
+```{r, include=FALSE, eval=FALSE}
+# Set the path to the directory containing the files
+path <- "data/older lemr evictions data - contains organization/Evictions, 2010 to 2020, 20210804/L applications"
+
+file_list <- list.files(path, full.names = TRUE, pattern = "\\.xlsx$")
+
+
+
+# Define a function to rename columns if they exist
+rename_columns <- function(df) {
+  rename_map <- c(
+    "Notice" = "Notice Type",
+    "Notice Form" = "Notice Type",
+    "File Number" = "Case Number",
+    #"File Submission Date" = "Filing Date",
+    #"Close Date" = "Disposition Date",
+    "Reason for Closure" = "Disposition",
+    "Application Type" = "Category",
+     "Applications" = "Case Type"
+
+  )
+
+  for (original_name in names(rename_map)) {
+    if (original_name %in% names(df)) {
+      names(df)[names(df) == original_name] <- rename_map[[original_name]]
+    }
+  }
+  return(df)
+}
+
+
+# Read and bind all the files together
+combined_organization_data <- file_list %>%
+  lapply(function(file) {
+    df <- read_excel(file)
+    df <- rename_columns(df)
+    df$file_source <- file
+    return(df)
+  }) %>%
+  bind_rows()
+
+combined_organization_data <- combined_organization_data |>
+  janitor::clean_names() |>
+  ungroup() |>
+  mutate(
+    rental_unit_address = pmap_chr(list(street_number, street_name, city, postal_code), function(...) {
+    paste(na.omit(c(...)), collapse = " ")
+    }),
+    #notice_type = str_replace(notice_type, "Form ", ""),
+    #file_submission_date = as.Date(file_submission_date, format = "%Y-%m-%d"),
+    filing_date = as.Date(filing_date),
+    disposition_date = as.Date(disposition_date),
+    #close_date = as.Date(close_date, format = "%Y-%m-%d"),
+    #disposition_date = if_else(is.na(disposition_date), close_date, as.Date(disposition_date)),
+    #case_type = ifelse(is.na(case_type), applications, case_type)
+    #disposition = ifelse(is.na(disposition), stage, disposition)
+  ) |>
+  select(-any_of(c("street_number",  "street_name", "city", "postal_code", "temp_address")))
+
+joined <- combined_organization_data |> left_join(combined_apps_data, by = "case_number")
+
+table(is.na(joined$case_type.y))
+
+
+#saveRDS(df, "data/combined_notice_data.rds")
+
+```

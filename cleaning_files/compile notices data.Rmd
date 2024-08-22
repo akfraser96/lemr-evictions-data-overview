@@ -1,0 +1,287 @@
+---
+title: "compile notices data"
+author: "Adam Fraser"
+date: "2024-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(sf)
+library(ggmap)
+library(purrr)
+library(leaflet)
+```
+
+
+# make eda and cleaning process two separate tabs on same html. 
+
+```{r, include=FALSE, eval=FALSE}
+# Set the path to the directory containing the files
+path <- "data/ontario_evictions_filings_2010_to_2022/notices"
+
+file_list <- list.files(path, full.names = TRUE)
+
+
+
+# Define a function to rename columns if they exist
+rename_columns <- function(df) {
+  rename_map <- c(
+    "Notice" = "Notice Type",
+    "Notice Form" = "Notice Type",
+    "File Number" = "Case Number",
+    #"File Submission Date" = "Filing Date",
+    #"Close Date" = "Disposition Date",
+    "Reason for Closure" = "Disposition",
+    "Application Type" = "Category",
+     "Applications" = "Case Type",
+    "File: File Number" = "Case Number",
+    "Document Type" = "Notice Type",
+    "Document Shell Type" = "Notice Type",
+    "Email Rental Unit Address" = "Rental Unit Address", ### I am assuming this column naming was an error to include "email"
+    "Date Received" = "Filing Date", ### Assuming these are the same
+    "Primary Rental Unit Region" = "Case Region",
+    "Rental Unit Region" = "Case Region",
+    "Stage" = "Case Status",
+    "Closed Date" = "Close Date"
+  )
+
+  for (original_name in names(rename_map)) {
+    if (original_name %in% names(df)) {
+      names(df)[names(df) == original_name] <- rename_map[[original_name]]
+    }
+  }
+  return(df)
+}
+
+
+# Read and bind all the files together
+combined_notice_data <- file_list %>%
+  lapply(function(file) {
+    df <- read_excel(file)
+    df <- rename_columns(df)
+    df$file_source <- basename(file)
+    return(df)
+  }) %>%
+  bind_rows()
+
+
+combined_notice_data <- combined_notice_data |>
+  #slice(1:30) |>
+  janitor::clean_names() |>
+  ungroup() |>
+  mutate(
+    temp_address = pmap_chr(list(street_number, street_name, city, postal_code), function(...) {
+    paste(na.omit(c(...)), collapse = " ")
+    }),
+    rental_unit_address = coalesce(rental_unit_address, temp_address),
+    notice_type = str_replace(notice_type, "Form ", ""),
+    file_submission_date = as.Date(file_submission_date, format = "%Y-%m-%d"),
+    filing_date = if_else(is.na(filing_date), file_submission_date, as.Date(filing_date)),
+    close_date = as.Date(close_date, format = "%Y-%m-%d"),
+    disposition_date = if_else(is.na(disposition_date), close_date, as.Date(disposition_date))
+    #case_type = ifelse(is.na(case_type), applications, case_type)
+    #disposition = ifelse(is.na(disposition), stage, disposition)
+  ) |>
+  select(-any_of(c("close_date", "applications", "street_number", "file_submission_date", "street_name", "street_type", "temp_address"))) |>
+  mutate(filing_year = year(filing_date),
+         file_source_group = case_when(
+           grepl("ACORN", file_source) ~ "ACORN",
+           !grepl("ACORN", file_source) ~ "LEMR"
+           #!grepl("ACORN", file_source) & grepl("Dec 8 21 to Dec 31 22", file_source) ~ "LEMR notices 2021-2022",
+         ))
+```
+
+## group by file_source, year and notice type to look at disparities between data
+
+* ACORN data mirrors LEMR very closely where we have both data sources. Except for 2022. LEMR 2022 data is exceptionally low compared to previous years across all notice types. This would be very peculiar if it were not for the fact that the data is incomplete. I will therefore trust the ACORN data and remove LEMR 2022 data for N13. I will put a flag for the rest of LEMR 2022 data indicating it is likely incomplete data.
+
+```{r}
+p <- combined_notice_data |> mutate(filing_year = year(filing_date)) |> group_by(file_source_group, filing_year, notice_type) |> summarize(count = n(), .groups = "drop") |> arrange(desc(count)) |>
+  ggplot(aes(x = filing_year, y = count, fill = file_source_group, colour = file_source_group)) +
+  #geom_col(position = "dodge") +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~notice_type, scales = "free_y") +
+  labs(title = "Notice Type Count by Year and Data Source", x = "Year", y = "Count") +
+  theme_bw() 
+  # theme(
+  #   legend.position = "none"
+  # ) 
+
+plotly::ggplotly(p)
+```
+
+## Replace LEMR 2022 data with ACORN data for N13
+
+```{r}
+combined_notice_data <- combined_notice_data |>
+  filter(!(file_source_group == "LEMR" & filing_year == 2022 & notice_type == "N13")) |>
+  mutate(use_with_caution = ifelse(file_source_group == "LEMR" & filing_year == 2022, "likely missing records for this year. suspect an undercount", NA))
+
+```
+
+## Remove incomplete records
+```{r}
+# there are 28 notices with no information other than notice type and filing date (doesn't even have a case number). I will remove these records.
+combined_notice_data |>
+  mutate(reason_to_remove = case_when(
+    # there are 28 notices with no information other than notice type and filing date (doesn't even have a case number). I will remove these records.
+    is.na(case_number) ~ "no case number",
+    # remove caseses = Cancelled by Coordinator – the application was data entered in error
+    disposition == "Cancelled by Coordinator" ~ "the application was data entered in error",
+    TRUE ~ NA_character_
+  )) |>
+  filter(!is.na(reason_to_remove)) |>
+  arrange(reason_to_remove) |>
+  relocate(reason_to_remove, .before = case_number)
+
+combined_notice_data <- combined_notice_data |> filter(!is.na(case_number) & disposition != "Cancelled by Coordinator")
+```
+
+## Check for duplicates
+
+* Duplicate entries look to be multiple simultaneous filings under a multi-tenant application. The distribution is presented below, showing number of identical case numbers and notice types. For instance, 1 individual filing contained 23 notices, and there was only 1 instance of a filing containing 23 identical notices.  
+
+```{r}
+multiples <- combined_notice_data |>
+  group_by(case_number,notice_type, filing_year) |>
+  add_count() |> 
+  arrange(desc(n), case_number)
+
+multiples |>
+  slice(1) |>
+  rename(case_number_multiples = n) |>
+  group_by(case_number_multiples) |>
+  summarize(frequency = n()) 
+```
+
+## Look at missing data
+
+```{r}
+# Function to summarize missing values in each column
+summarize_missing_data <- function(df) {
+  missing_summary <- sapply(df, function(col) {
+    missing_count <- sum(is.na(col))  # Count missing values
+    total_count <- length(col)  # Total number of rows in the column
+    missing_percentage <- (missing_count / total_count) * 100  # Calculate percentage
+    return(c(missing_count = missing_count, missing_percentage = missing_percentage))
+  })
+  
+  # Convert the result into a data frame for better readability
+  missing_summary_df <- as.data.frame(t(missing_summary))
+  
+  # Optionally, round the missing percentage for cleaner output
+  missing_summary_df$missing_percentage <- round(missing_summary_df$missing_percentage, 2)
+  
+  return(missing_summary_df)
+}
+
+# Example usage with your combined data
+missing_summary <- summarize_missing_data(combined_notice_data)
+
+missing_summary |>
+  arrange(desc(missing_count)) |>
+  kableExtra::kable()
+
+```
+
+note to self..... look closer at case status 
+
+## Final processing of cleaned dataset
+
+* filter out 
+
+```{r}
+cleaned_notice_data <- combined_notice_data |>
+  group_by(notice_type, filing_year) |>
+  mutate(both_lemr_acorn_data = ifelse(any(file_source_group == "LEMR") & any(file_source_group == "ACORN"), TRUE, FALSE)) |>
+  filter(is.na(use_with_caution) & !(file_source_group == "LEMR" & both_lemr_acorn_data == TRUE))
+
+# reorder columns for better readability
+cleaned_notice_data <- cleaned_notice_data |> select(case_number, category, case_type, notice_type, filing_date, filing_year, landlord_names, rental_unit_address, postal_code, city, case_region, case_status, disposition, disposition_date, closed_date, file_source, use_with_caution)
+
+#saveRDS(cleaned_notice_data, "data/cleaned/cleaned_notice_data.rds")
+```
+
+
+
+# Data Analysis
+
+## N13 Notices (Renoviction) Data
+
+* N13 notices are included up to the end of August 2023. This is the only data we have for 2023.
+* Since data only goes up to August, data is presented by 4-month periods, for more equal comparison.
+
+```{r}
+# remove cautioned data - data undercounted in 2022.
+cleaned_notice_data <- cleaned_notice_data |>
+   filter(is.na(use_with_caution))
+
+
+date_label <- function(date) {
+  year <- year(date)
+  month_start <- month(date, label = TRUE, abbr = TRUE)
+  month_end <- month(date + months(3), label = TRUE, abbr = TRUE)
+  return(paste(year, month_start, "-", month_end))
+}
+
+cleaned_notice_data <- cleaned_notice_data %>%
+  filter(notice_type == "N13") %>%
+  mutate(filing_period = floor_date(filing_date, "4 months"))
+
+# Summarize the data by the 4-month period
+summary_data <- cleaned_notice_data %>%
+  group_by(filing_period) %>%
+  summarize(total_cases = n(), .groups = 'drop')
+
+# Custom date formatting function
+date_label <- function(date) {
+  year <- year(date)
+  month_start <- month(date, label = TRUE, abbr = TRUE)
+  month_end <- month(date + months(3), label = TRUE, abbr = TRUE)
+  return(paste(year, month_start, "-", month_end))
+}
+
+# Plotting with custom axis labels
+p <- ggplot(summary_data, aes(x = filing_period, y = total_cases)) +
+  geom_line(size = 0.75) +
+  geom_point(size = 1.5, aes(text = paste("Period:", date_label(filing_period),
+                                          "<br>Total Cases:", total_cases))) +
+  scale_x_date(labels = date_label, breaks = summary_data$filing_period[seq(2, nrow(summary_data), by = 3)]) +
+  labs(
+    x = "Filing Period",
+    y = "Total Cases",
+    title = "N13 Filings per 4-Month Period (2010 - August 2023)",
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) 
+  )
+
+plotly::ggplotly(p, tooltip = "text")
+```
+
+
+## All notice data that we possess
+
+```{r, fig.width=10, fig.height=6}
+p <- cleaned_notice_data |> 
+  filter(filing_year <= 2022) |>
+  group_by(filing_year, notice_type) |> summarize(count = n(), .groups = "drop") |> 
+  ggplot(aes(x = filing_year, y = count)) +
+  #geom_col(position = "dodge") +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~notice_type, scales = "free_y") +
+  labs(title = "Notice Type Count by Year 2010-2022", x = "Year", y = "Count") +
+  theme_bw() 
+
+plotly::ggplotly(p)
+```
+
+# By Region
+
+
